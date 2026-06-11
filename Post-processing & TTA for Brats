@@ -1,0 +1,38 @@
+
+# =============================================================================
+# Post-processing & TTA
+# =============================================================================
+def remove_small_cc(seg):
+    out=seg.copy()
+    for c,msz in enumerate([CFG.MIN_CC_SIZE_WT,CFG.MIN_CC_SIZE_TC,CFG.MIN_CC_SIZE_ET]):
+        lab,n=ndi.label(out[c]>0.5)
+        for lid in range(1,n+1):
+            if (lab==lid).sum()<msz: out[c][lab==lid]=0
+    out[1]=np.maximum(out[1],out[2]); out[0]=np.maximum(out[0],out[1])
+    return out.astype(np.float32)
+
+@torch.no_grad()
+def predict_tta(model, patch_t, use_tta=False):
+    logits,_,_=model(patch_t)
+    if not use_tta: return torch.sigmoid(logits)
+    probs=[torch.sigmoid(logits)]
+    for dims in [(2,),(3,),(4,),(2,3),(2,4),(3,4)]:
+        lf,_,_=model(torch.flip(patch_t,dims=dims))
+        probs.append(torch.flip(torch.sigmoid(lf),dims=dims))
+    return torch.stack(probs).mean(0)
+
+
+# =============================================================================
+# Device
+# =============================================================================
+def get_device():
+    if not torch.cuda.is_available():
+        logger.warning("CUDA unavailable — using CPU"); return torch.device("cpu")
+    try:
+        cap=torch.cuda.get_device_capability(0); name=torch.cuda.get_device_name(0)
+        logger.info(f"GPU: {name} | sm_{cap[0]}{cap[1]}")
+        if cap[0]<7:
+            logger.warning("GPU compute < 7.0 — falling back to CPU"); return torch.device("cpu")
+        return torch.device("cuda")
+    except Exception as e:
+        logger.warning(f"CUDA error: {e} — using CPU"); return torch.device("cpu")
