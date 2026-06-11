@@ -1,0 +1,79 @@
+ =============================================================================
+# Reproducibility
+# =============================================================================
+def seed_everything(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+
+
+# =============================================================================
+# Dataset utilities
+# =============================================================================
+def scan_dataset(root: str) -> List[str]:
+    root_path = Path(root)
+    if not root_path.exists():
+        raise FileNotFoundError(f"Dataset root not found: {root}")
+    candidates = sorted([p for p in root_path.rglob("BraTS20_Training_*") if p.is_dir()])
+    if not candidates:
+        candidates = sorted(list({p.parent for p in root_path.rglob("*_flair.nii*")}))
+    valid = [str(d) for d in candidates
+             if all(len(list(d.glob(f"*_{s}.nii*")))>0 for s in ["flair","t1","t1ce","t2","seg"])]
+    logger.info(f"Valid patients: {len(valid)}")
+    if not valid:
+        raise RuntimeError("No valid BraTS training folders found.")
+    return valid
+
+
+def load_nifti(folder: str, suffix: str) -> Tuple[np.ndarray, nib.Nifti1Image]:
+    matches = glob.glob(os.path.join(folder, f"*_{suffix}.nii*"))
+    if not matches:
+        raise FileNotFoundError(f"Missing '{suffix}' in {folder}")
+    nii = nib.load(matches[0])
+    return nii.get_fdata(dtype=np.float32), nii
+
+
+def zscore_nonzero(vol: np.ndarray) -> np.ndarray:
+    mask = vol > 0
+    out  = np.zeros_like(vol, dtype=np.float32)
+    if mask.sum() == 0: return out
+    out[mask] = (vol[mask] - vol[mask].mean()) / (vol[mask].std() + 1e-8)
+    return out
+
+
+def crop_to_nonzero(image, seg, margin=5):
+    brain = np.any(image != 0, axis=0)
+    coords = np.argwhere(brain)
+    if coords.size == 0: return image, seg
+    mins = np.maximum(coords.min(axis=0) - margin, 0)
+    maxs = np.minimum(coords.max(axis=0) + margin + 1, image.shape[1:])
+    h0,w0,d0 = mins; h1,w1,d1 = maxs
+    return image[:,h0:h1,w0:w1,d0:d1], seg[h0:h1,w0:w1,d0:d1]
+
+
+def build_label_channels(seg):
+    wt = ((seg==1)|(seg==2)|(seg==4)).astype(np.float32)
+    tc = ((seg==1)|(seg==4)).astype(np.float32)
+    et = (seg==4).astype(np.float32)
+    return np.stack([wt, tc, et], axis=0)
+
+
+def make_boundary_np(label):
+    union = (label.sum(axis=0) > 0).astype(np.uint8)
+    if union.sum() == 0:
+        return np.zeros((1,)+union.shape, dtype=np.float32)
+    struct = ndi.generate_binary_structure(3, 1)
+    bnd = (ndi.binary_dilation(union, struct).astype(np.uint8)
+         - ndi.binary_erosion(union, struct).astype(np.uint8)).clip(0,1)
+    return bnd[None].astype(np.float32)
+
+
+def load_patient(folder):
+    mods = [zscore_nonzero(load_nifti(folder, m)[0]) for m in CFG.MODALITIES]
+    image = np.stack(mods, 0).astype(np.float32)
+    seg, _ = load_nifti(folder, "seg")
+    image, seg = crop_to_nonzero(image, seg.astype(np.int16))
+    label    = build_label_channels(seg)
+    boundary = make_boundary_np(label)
+    return image, label, boundary
+
