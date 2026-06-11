@@ -1,0 +1,35 @@
+ Losses
+# =============================================================================
+def dice_loss(logits, target, smooth=1e-5):
+    p=torch.sigmoid(logits).flatten(2); t=target.flatten(2)
+    inter=(p*t).sum(-1)
+    return 1-((2*inter+smooth)/(p.sum(-1)+t.sum(-1)+smooth)).mean()
+
+def bce_loss(logits, target):
+    pw=torch.tensor(CFG.BCE_POS_WEIGHT,device=logits.device).view(1,3,1,1,1)
+    return F.binary_cross_entropy_with_logits(logits,target,pos_weight=pw)
+
+def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75, smooth=1e-5):
+    p=torch.sigmoid(logits).flatten(2); t=target.flatten(2)
+    tp=(p*t).sum(-1); fp=(p*(1-t)).sum(-1); fn=((1-p)*t).sum(-1)
+    tv=(tp+smooth)/(tp+alpha*fp+beta*fn+smooth)
+    cw=torch.tensor(CFG.FTV_CLASS_WEIGHT,device=logits.device).view(1,3)
+    return ((1-tv).pow(gamma)*cw).mean()
+
+def boundary_loss(bnd_logits, bnd_gt):
+    return F.binary_cross_entropy_with_logits(bnd_logits, bnd_gt)
+
+def deep_sup_loss(ds_logits, target):
+    if not ds_logits: return torch.tensor(0.0,device=target.device)
+    loss=0.0
+    for logit,w in zip(ds_logits,[0.5,0.3,0.2]):
+        tgt=F.interpolate(target,size=logit.shape[2:],mode="nearest")
+        loss=loss+w*dice_loss(logit,tgt)
+    return loss
+
+def combined_loss(seg, bnd, ds, seg_gt, bnd_gt):
+    l_dice=dice_loss(seg,seg_gt); l_bce=bce_loss(seg,seg_gt)
+    l_ftv=focal_tversky_loss(seg,seg_gt); l_bnd=boundary_loss(bnd,bnd_gt)
+    l_ds=deep_sup_loss(ds,seg_gt) if CFG.USE_DEEP_SUPERVISION else torch.tensor(0.0)
+    total=(CFG.W_DICE*l_dice+CFG.W_BCE*l_bce+CFG.W_FTV*l_ftv+CFG.W_BOUNDARY*l_bnd+CFG.W_DEEP*l_ds)
+    return total, dict(dice=l_dice.item(),bce=l_bce.item(),ftv=l_ftv.item(),boundary=l_bnd.item())
