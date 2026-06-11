@@ -1,0 +1,114 @@
+# =============================================================================
+# Model
+# =============================================================================
+class ConvINAct(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.net=nn.Sequential(nn.Conv3d(in_ch,out_ch,k,s,p,bias=False),
+                               nn.InstanceNorm3d(out_ch,affine=True),
+                               nn.LeakyReLU(0.01,inplace=True))
+    def forward(self,x): return self.net(x)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.c1=ConvINAct(in_ch,out_ch)
+        self.c2=nn.Sequential(nn.Conv3d(out_ch,out_ch,3,1,1,bias=False),nn.InstanceNorm3d(out_ch,affine=True))
+        self.proj=nn.Identity() if in_ch==out_ch else nn.Conv3d(in_ch,out_ch,1,bias=False)
+        self.act=nn.LeakyReLU(0.01,inplace=True)
+    def forward(self,x): return self.act(self.c2(self.c1(x))+self.proj(x))
+
+
+class TransformerBlock3D(nn.Module):
+    def __init__(self, dim, heads=4, mlp_ratio=2.0, dropout=0.1):
+        super().__init__()
+        self.n1=nn.LayerNorm(dim); self.attn=nn.MultiheadAttention(dim,heads,dropout=dropout,batch_first=True)
+        self.n2=nn.LayerNorm(dim)
+        hidden=int(dim*mlp_ratio)
+        self.mlp=nn.Sequential(nn.Linear(dim,hidden),nn.GELU(),nn.Dropout(dropout),nn.Linear(hidden,dim),nn.Dropout(dropout))
+    def forward(self,x):
+        b,c,h,w,d=x.shape; t=x.flatten(2).transpose(1,2)
+        z=self.n1(t); a,_=self.attn(z,z,z,need_weights=False); t=t+a
+        t=t+self.mlp(self.n2(t))
+        return t.transpose(1,2).reshape(b,c,h,w,d)
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, ch, r=8):
+        super().__init__()
+        mid=max(ch//r,4)
+        self.net=nn.Sequential(nn.AdaptiveAvgPool3d(1),nn.Conv3d(ch,mid,1),nn.ReLU(inplace=True),nn.Conv3d(mid,ch,1),nn.Sigmoid())
+    def forward(self,x): return x*self.net(x)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv=nn.Sequential(nn.Conv3d(2,1,7,padding=3,bias=False),nn.Sigmoid())
+    def forward(self,x):
+        return x*self.conv(torch.cat([x.mean(1,keepdim=True),x.max(1,keepdim=True).values],1))
+
+
+class HARB(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.reduce=ConvINAct(in_ch,out_ch,k=1,p=0)
+        self.ca=ChannelAttention(out_ch); self.sa=SpatialAttention()
+        self.bnd_gate=nn.Sequential(nn.Conv3d(out_ch,out_ch//2,3,padding=1,bias=False),
+                                    nn.InstanceNorm3d(out_ch//2,affine=True),nn.LeakyReLU(0.01,inplace=True),
+                                    nn.Conv3d(out_ch//2,1,1),nn.Sigmoid())
+        self.refine=ResBlock(out_ch,out_ch)
+    def forward(self,x):
+        x=self.reduce(x); x=self.ca(x); x=self.sa(x)
+        gate=self.bnd_gate(x); x=self.refine(x*(1.0+gate))
+        return x, gate
+
+
+class MultiScaleAgg(nn.Module):
+    def __init__(self, channels, out_ch):
+        super().__init__()
+        self.proj=nn.ModuleList([ConvINAct(c,out_ch,k=1,p=0) for c in channels])
+        self.fuse=nn.Sequential(ConvINAct(out_ch*len(channels),out_ch),ResBlock(out_ch,out_ch))
+    def forward(self, feats, target_size):
+        ups=[F.interpolate(p(f),size=target_size,mode="trilinear",align_corners=False)
+             if f.shape[2:]!=target_size else p(f) for f,p in zip(feats,self.proj)]
+        return self.fuse(torch.cat(ups,1))
+
+
+class BMTHARNetPP(nn.Module):
+    def __init__(self, in_ch=4, classes=3, base=16, depth=1, heads=4, dropout=0.1, deep_sup=False):
+        super().__init__()
+        self.deep_sup=deep_sup; F=base
+        self.stem=ResBlock(in_ch,F)
+        self.e1=ResBlock(F,F);     self.d1=ConvINAct(F,F*2,s=2)
+        self.e2=ResBlock(F*2,F*2); self.d2=ConvINAct(F*2,F*4,s=2)
+        self.e3=ResBlock(F*4,F*4); self.d3=ConvINAct(F*4,F*8,s=2)
+        self.e4=ResBlock(F*8,F*8); self.d4=ConvINAct(F*8,F*16,s=2)
+        self.bot=ResBlock(F*16,F*16)
+        self.transformer=nn.Sequential(*[TransformerBlock3D(F*16,heads,2.0,dropout) for _ in range(depth)])
+        self.up4=nn.ConvTranspose3d(F*16,F*8,2,stride=2);  self.h4=HARB(F*16,F*8)
+        self.up3=nn.ConvTranspose3d(F*8,F*4,2,stride=2);   self.h3=HARB(F*8,F*4)
+        self.up2=nn.ConvTranspose3d(F*4,F*2,2,stride=2);   self.h2=HARB(F*4,F*2)
+        self.up1=nn.ConvTranspose3d(F*2,F,2,stride=2);     self.h1=HARB(F*2,F)
+        self.agg=MultiScaleAgg([F,F*2,F*4,F*8],F)
+        self.seg_head=nn.Sequential(ConvINAct(F,F),nn.Conv3d(F,classes,1))
+        self.bnd_head=nn.Sequential(ConvINAct(F,F),nn.Conv3d(F,1,1))
+        if deep_sup:
+            self.ds2=nn.Conv3d(F*2,classes,1); self.ds3=nn.Conv3d(F*4,classes,1); self.ds4=nn.Conv3d(F*8,classes,1)
+
+    def forward(self,x):
+        x0=self.stem(x)
+        s1=self.e1(x0); s2=self.e2(self.d1(s1)); s3=self.e3(self.d2(s2)); s4=self.e4(self.d3(s3))
+        z=self.bot(self.d4(s4)); z=self.transformer(z)
+        x=self.up4(z);  x4,_=self.h4(torch.cat([x,s4],1))
+        x=self.up3(x4); x3,_=self.h3(torch.cat([x,s3],1))
+        x=self.up2(x3); x2,_=self.h2(torch.cat([x,s2],1))
+        x=self.up1(x2); x1,_=self.h1(torch.cat([x,s1],1))
+        agg=self.agg([x1,x2,x3,x4],x1.shape[2:])
+        seg=self.seg_head(agg); bnd=self.bnd_head(agg)
+        ds=[]
+        if self.deep_sup and self.training:
+            ds=[self.ds2(x2),self.ds3(x3),self.ds4(x4)]
+        return seg,bnd,ds
+
