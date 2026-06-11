@@ -1,0 +1,65 @@
+# =============================================================================
+# FIGURE 5: Segmentation overlay on MRI slice
+# =============================================================================
+def plot_seg_overlay(patient_dir: str, model, device, patch_size):
+    try:
+        image, label, _ = load_patient(patient_dir)
+    except Exception as e:
+        logger.warning(f"Overlay fig skipped: {e}"); return
+
+    # pick center axial slice with most tumor
+    flair = image[0]   # (H,W,D)
+    tumor_sum = label.sum(axis=0).sum(axis=0).sum(axis=0)   # per depth slice
+    best_d = int(tumor_sum.argmax())
+    flair_slice = flair[:, :, best_d]
+    gt_wt = label[0, :, :, best_d]
+    gt_tc = label[1, :, :, best_d]
+    gt_et = label[2, :, :, best_d]
+
+    # model prediction on full volume
+    model.eval()
+    with torch.no_grad():
+        vol_t = torch.from_numpy(image[None]).to(device)
+        # if volume too large, just use center patch
+        ph,pw,pd = patch_size
+        H,W,D = image.shape[1:]
+        z0=max(0,H//2-ph//2); y0=max(0,W//2-pw//2); x0=max(0,D//2-pd//2)
+        patch = image[:, z0:z0+ph, y0:y0+pw, x0:x0+pd]
+        patch = np.pad(patch, [(0,0),(0,max(ph-patch.shape[1],0)),
+                               (0,max(pw-patch.shape[2],0)),(0,max(pd-patch.shape[3],0))],mode="constant")
+        pt = torch.from_numpy(patch[None]).to(device)
+        with autocast(enabled=CFG.AMP):
+            seg_logits,_,_ = model(pt)
+        pred = (torch.sigmoid(seg_logits)>CFG.THRESHOLD)[0].cpu().numpy()
+    # map back to slice — use GT slice if patch doesn't include best_d
+    d_in_patch = best_d - x0
+    if 0 <= d_in_patch < pd:
+        pred_wt = pred[0, :, :, d_in_patch]
+        pred_tc = pred[1, :, :, d_in_patch]
+        pred_et = pred[2, :, :, d_in_patch]
+    else:
+        pred_wt = np.zeros_like(gt_wt); pred_tc=pred_wt.copy(); pred_et=pred_wt.copy()
+
+    fig, axes = plt.subplots(2, 4, figsize=(14, 7))
+    titles_top = ["FLAIR", "GT: WT", "GT: TC", "GT: ET"]
+    titles_bot = ["FLAIR", "Pred: WT", "Pred: TC", "Pred: ET"]
+    gt_masks  = [None, gt_wt,   gt_tc,   gt_et]
+    pred_masks= [None, pred_wt, pred_tc, pred_et]
+    mask_colors= [None, COLORS["wt"], COLORS["tc"], COLORS["et"]]
+
+    for col, (title, gt, pr, mc) in enumerate(zip(titles_top, gt_masks, pred_masks, mask_colors)):
+        for row, (ax, mask, t) in enumerate([(axes[0,col], gt, titles_top[col]),
+                                              (axes[1,col], pr, titles_bot[col])]):
+            ax.imshow(flair_slice.T, cmap="gray", origin="lower")
+            if mask is not None:
+                overlay = np.zeros((*mask.T.shape, 4))
+                r,g,b = tuple(int(mc.lstrip("#")[i:i+2],16)/255 for i in (0,2,4))
+                overlay[mask.T>0.5] = [r,g,b,0.45]
+                ax.imshow(overlay, origin="lower")
+            ax.set_title(t, fontsize=9); ax.axis("off")
+
+    fig.suptitle("Segmentation Overlay — Ground Truth vs Prediction", fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    out = os.path.join(FIGURES_DIR, "fig5_seg_overlay.png")
+    fig.savefig(out); plt.close(fig)
+    logger.info(f"Saved: {out}")
