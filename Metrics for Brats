@@ -1,0 +1,28 @@
+# =============================================================================
+# Metrics
+# =============================================================================
+def compute_metrics(logits, target, threshold=0.5, smooth=1e-5):
+    pred=(torch.sigmoid(logits)>threshold).float()
+    p=pred.flatten(2); t=target.flatten(2)
+    tp=(p*t).sum(-1); fp=(p*(1-t)).sum(-1); fn=((1-p)*t).sum(-1); tn=((1-p)*(1-t)).sum(-1)
+    dice=(2*tp+smooth)/(2*tp+fp+fn+smooth)
+    iou=(tp+smooth)/(tp+fp+fn+smooth)
+    prec=(tp+smooth)/(tp+fp+smooth)
+    rec=(tp+smooth)/(tp+fn+smooth)
+    spec=(tn+smooth)/(tn+fp+smooth)
+    return dice.mean(0),iou.mean(0),prec.mean(0),rec.mean(0),spec.mean(0)
+
+
+def hd95_binary(pred, gt):
+    pred=pred.astype(bool); gt=gt.astype(bool)
+    if pred.sum()==0 and gt.sum()==0: return 0.0
+    if pred.sum()==0 or gt.sum()==0:  return 373.0
+    struct=ndi.generate_binary_structure(3,1)
+    pb=pred^ndi.binary_erosion(pred,struct); gb=gt^ndi.binary_erosion(gt,struct)
+    dt_gt=ndi.distance_transform_edt(~gb); dt_pred=ndi.distance_transform_edt(~pb)
+    return float(np.percentile(np.concatenate([dt_gt[pb],dt_pred[gb]]),95))
+
+def hd95_per_class(logits, target):
+    pred=(torch.sigmoid(logits)>0.5).cpu().numpy(); gt=target.cpu().numpy()
+    return [float(np.mean([hd95_binary(pred[b,c]>0.5,gt[b,c]>0.5) for b in range(pred.shape[0])]))
+            for c in range(pred.shape[1])]
